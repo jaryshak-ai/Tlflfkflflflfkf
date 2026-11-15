@@ -1,0 +1,935 @@
+name: Build Morph
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/eclips/morph src/main/resources
+
+          cat > pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>eclips</groupId>
+            <artifactId>morph</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>lanink-repo</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <finalName>Morph</finalName>
+            </build>
+          </project>
+          POM_EOF
+
+          cat > src/main/resources/plugin.yml <<'YML_EOF'
+          name: Morph
+          main: eclips.morph.MorphPlugin
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: Eclips
+          description: Morph into mobs via GUI menu
+          commands:
+            morpmenu:
+              description: Open mob morph menu
+              usage: /morpmenu
+              permission: morph.admin
+              aliases: [morphmenu]
+          permissions:
+            morph.admin:
+              description: Access to /morpmenu
+              default: op
+          YML_EOF
+
+          cat > src/main/java/eclips/morph/MorphPlugin.java <<'JAVA_EOF'
+          package eclips.morph;
+
+          import cn.nukkit.AdventureSettings;
+          import cn.nukkit.Player;
+          import cn.nukkit.Server;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.event.entity.EntityExplosionPrimeEvent;
+          import cn.nukkit.event.player.PlayerDeathEvent;
+          import cn.nukkit.event.player.PlayerAnimationEvent;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.event.player.PlayerToggleSneakEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.level.particle.HugeExplodeSeedParticle;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.network.protocol.PlaySoundPacket;
+          import cn.nukkit.network.protocol.EntityEventPacket;
+          import cn.nukkit.network.protocol.MoveEntityAbsolutePacket;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.potion.Effect;
+          import cn.nukkit.scheduler.Task;
+
+          import java.lang.reflect.Method;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+
+          public class MorphPlugin extends PluginBase implements Listener {
+
+              // ===== Настройки =====
+              private static final int FORM_ID = 0x4D0A11;
+              private static final String TAG = "EclipsMorphDouble";
+              private static final String PREFIX = "§6[Eclips] §f";
+              private static final int INVISIBILITY = 14;
+              // true = моб скрыт от самого владельца (не мешает обзору от первого лица)
+              private static final boolean HIDE_FROM_OWNER = false;
+
+              private static final long CREEPER_COOLDOWN = 8000L;
+              private static final int CREEPER_FUSE_TICKS = 30;
+              private static final double CREEPER_RADIUS = 4.0;
+              private static final float CREEPER_DAMAGE = 8f;
+
+              private static final long ENDERMAN_COOLDOWN = 3000L;
+              private static final double BLINK_RANGE = 16.0;
+
+              private static final long CHICKEN_COOLDOWN = 20000L;
+              private static final long SOUND_COOLDOWN = 2000L;
+
+              // ===== Служебное =====
+              private static Method updateMovement;
+
+              static {
+                  try {
+                      updateMovement = Entity.class.getDeclaredMethod("updateMovement");
+                      updateMovement.setAccessible(true);
+                  } catch (Throwable t) {
+                      updateMovement = null;
+                  }
+              }
+
+              enum MobType {
+                  // эффекты: {id эффекта, уровень (0 = I)}
+                  CREEPER("Creeper", "§2Крипер", "Shift: взрыв", new int[][]{}, false, 0.95f),
+                  ENDERMAN("Enderman", "§5Эндермен", "Shift: телепорт, вода жжёт", new int[][]{{1, 0}}, false, 1.6f),
+                  PHANTOM("Phantom", "§9Фантом", "Полёт, ночное зрение", new int[][]{{16, 0}}, true, 0.5f),
+                  RABBIT("Rabbit", "§aКролик", "Высокие прыжки, скорость", new int[][]{{8, 2}, {1, 1}}, true, 0.45f),
+                  CAT("Cat", "§6Кот", "Shift: сесть и мяукнуть, ловкость", new int[][]{{1, 0}, {16, 0}}, true, 0.45f),
+                  WOLF("Wolf", "§fВолк", "Shift: сесть и гавкнуть, сила", new int[][]{{5, 0}, {1, 0}}, false, 0.5f),
+                  CHICKEN("Chicken", "§eКурица", "Планирование, Shift: яйцо", new int[][]{{27, 0}}, true, 0.4f),
+                  COW("Cow", "§8Корова", "Shift: мычание, защита", new int[][]{{11, 0}}, false, 0.8f);
+
+                  final String entityName;
+                  final String title;
+                  final String info;
+                  final int[][] effects;
+                  final boolean noFall;
+                  final float scale;
+
+                  MobType(String entityName, String title, String info, int[][] effects, boolean noFall, float scale) {
+                      this.entityName = entityName;
+                      this.title = title;
+                      this.info = info;
+                      this.effects = effects;
+                      this.noFall = noFall;
+                      this.scale = scale;
+                  }
+              }
+
+              static final class Session {
+                  final Player player;
+                  final MobType type;
+                  Entity dbl;
+                  boolean hadAllowFlight;
+                  float hadScale = 1f;
+                  boolean hadInvisible;
+                  double bodyYaw;
+                  boolean bodyInit;
+                  double lastX;
+                  double lastZ;
+                  int angryTicks;
+                  boolean hadNameVisible;
+                  boolean hadNameAlways;
+                  final Set<Integer> preexisting = new HashSet<>();
+                  int fuseTicks;
+                  long readyAt;
+                  boolean sitting;
+
+                  Session(Player player, MobType type) {
+                      this.player = player;
+                      this.type = type;
+                  }
+              }
+
+              private final Map<UUID, Session> sessions = new HashMap<>();
+              private final Map<Long, Session> byDouble = new HashMap<>();
+              private long tickCounter = 0;
+
+              // ===== Жизненный цикл =====
+              @Override
+              public void onEnable() {
+                  getServer().getPluginManager().registerEvents(this, this);
+                  cleanLeftovers();
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          tick();
+                      }
+                  }, 1);
+                  getLogger().info("Morph включён");
+              }
+
+              @Override
+              public void onDisable() {
+                  for (Session s : new ArrayList<>(sessions.values())) {
+                      unmorph(s.player, true);
+                  }
+              }
+
+              private void cleanLeftovers() {
+                  try {
+                      for (Level lvl : getServer().getLevels().values()) {
+                          for (Entity en : lvl.getEntities()) {
+                              if (en.namedTag != null && en.namedTag.getBoolean(TAG)) {
+                                  en.close();
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              // ===== Команда и меню =====
+              private boolean hasAccess(Player p) {
+                  return p.isOp() || p.hasPermission("morph.admin");
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("morpmenu")) {
+                      return false;
+                  }
+                  if (!(sender instanceof Player)) {
+                      sender.sendMessage("Команда только для игроков.");
+                      return true;
+                  }
+                  Player p = (Player) sender;
+                  if (!hasAccess(p)) {
+                      p.sendMessage(PREFIX + "§cУ тебя нет прав на эту команду.");
+                      return true;
+                  }
+                  openMenu(p);
+                  return true;
+              }
+
+              private void openMenu(Player p) {
+                  Session cur = sessions.get(p.getUniqueId());
+                  String now = cur == null ? "§7Сейчас: §fчеловек" : "§7Сейчас: " + cur.type.title;
+                  FormWindowSimple form = new FormWindowSimple("§l§5Превращения",
+                          now + "\n§7Выбери моба. Shift — способность моба.\n§7Ник скрыт, рост и камера как у моба.");
+                  for (MobType t : MobType.values()) {
+                      form.addButton(new ElementButton(t.title + "\n§8" + t.info));
+                  }
+                  form.addButton(new ElementButton("§c§lСнять превращение\n§8Вернуть обычный облик"));
+                  p.showFormWindow(form, FORM_ID);
+              }
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  if (e.getFormID() != FORM_ID) {
+                      return;
+                  }
+                  if (e.wasClosed() || !(e.getResponse() instanceof FormResponseSimple)) {
+                      return;
+                  }
+                  Player p = e.getPlayer();
+                  if (!hasAccess(p)) {
+                      return;
+                  }
+                  int id = ((FormResponseSimple) e.getResponse()).getClickedButtonId();
+                  MobType[] types = MobType.values();
+                  if (id >= 0 && id < types.length) {
+                      morph(p, types[id]);
+                  } else {
+                      if (sessions.containsKey(p.getUniqueId())) {
+                          unmorph(p, false);
+                      } else {
+                          p.sendMessage(PREFIX + "§7Ты и так в обычном облике.");
+                      }
+                  }
+              }
+
+              // ===== Превращение =====
+              private void morph(Player p, MobType type) {
+                  unmorph(p, true);
+
+                  Session s = new Session(p, type);
+                  if (!respawnDouble(s)) {
+                      p.sendMessage(PREFIX + "§cНе удалось создать моба " + type.entityName + ".");
+                      return;
+                  }
+
+                  s.hadAllowFlight = p.getAllowFlight();
+                  s.hadScale = p.getScale();
+                  s.hadInvisible = p.getDataFlag(Entity.DATA_FLAGS, flag("DATA_FLAG_INVISIBLE", 5));
+                  s.hadNameVisible = p.isNameTagVisible();
+                  s.hadNameAlways = p.isNameTagAlwaysVisible();
+                  for (int id : effectIds(type)) {
+                      if (p.hasEffect(id)) {
+                          s.preexisting.add(id);
+                      }
+                  }
+
+                  sessions.put(p.getUniqueId(), s);
+
+                  p.setScale(type.scale);
+                  p.setNameTagVisible(false);
+                  p.setNameTagAlwaysVisible(false);
+                  applyEffects(s);
+                  if (type == MobType.PHANTOM) {
+                      p.setAllowFlight(true);
+                  }
+
+                  p.sendMessage(PREFIX + "Ты превратился: " + type.title + "§f. §7" + type.info);
+              }
+
+              private void unmorph(Player p, boolean silent) {
+                  Session s = sessions.remove(p.getUniqueId());
+                  if (s == null) {
+                      return;
+                  }
+                  s.fuseTicks = 0;
+                  if (s.dbl != null) {
+                      byDouble.remove(s.dbl.getId());
+                      try {
+                          if (!s.dbl.isClosed()) {
+                              s.dbl.close();
+                          }
+                      } catch (Throwable ignored) {
+                      }
+                      s.dbl = null;
+                  }
+                  try {
+                      for (int id : effectIds(s.type)) {
+                          if (!s.preexisting.contains(id)) {
+                              p.removeEffect(id);
+                          }
+                      }
+                      p.setNameTagVisible(s.hadNameVisible);
+                      p.setNameTagAlwaysVisible(s.hadNameAlways);
+                      p.setScale(s.hadScale);
+                      setFlag(p, "DATA_FLAG_INVISIBLE", 5, s.hadInvisible);
+                      if (s.type == MobType.PHANTOM && !s.hadAllowFlight) {
+                          p.getAdventureSettings().set(AdventureSettings.Type.FLYING, false);
+                          p.setAllowFlight(false);
+                          p.resetFallDistance();
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  if (!silent) {
+                      p.sendMessage(PREFIX + "§7Ты снова человек.");
+                  }
+              }
+
+              private int[] effectIds(MobType type) {
+                  int[] ids = new int[type.effects.length];
+                  for (int i = 0; i < type.effects.length; i++) {
+                      ids[i] = type.effects[i][0];
+                  }
+                  return ids;
+              }
+
+              private void applyEffects(Session s) {
+                  setFlag(s.player, "DATA_FLAG_INVISIBLE", 5, true);
+                  for (int[] e : s.type.effects) {
+                      addEffect(s, e[0], e[1]);
+                  }
+              }
+
+              private void addEffect(Session s, int id, int amplifier) {
+                  if (s.preexisting.contains(id) || s.player.hasEffect(id)) {
+                      return;
+                  }
+                  try {
+                      Effect ef = Effect.getEffect(id);
+                      if (ef == null) {
+                          return;
+                      }
+                      ef.setDuration(1000000).setAmplifier(amplifier).setVisible(false);
+                      s.player.addEffect(ef);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              // ===== Моб-двойник =====
+              private boolean respawnDouble(Session s) {
+                  if (s.dbl != null) {
+                      byDouble.remove(s.dbl.getId());
+                      try {
+                          if (!s.dbl.isClosed()) {
+                              s.dbl.close();
+                          }
+                      } catch (Throwable ignored) {
+                      }
+                      s.dbl = null;
+                  }
+                  Entity d = createDouble(s);
+                  if (d == null) {
+                      return false;
+                  }
+                  s.dbl = d;
+                  byDouble.put(d.getId(), s);
+                  return true;
+              }
+
+              private Entity createDouble(Session s) {
+                  Player p = s.player;
+                  Entity d = null;
+                  try {
+                      d = Entity.createEntity(s.type.entityName, p.getLocation());
+                  } catch (Throwable t) {
+                      getLogger().warning("Не удалось создать " + s.type.entityName + ": " + t);
+                  }
+                  if (d == null) {
+                      return null;
+                  }
+                  try {
+                      d.namedTag.putBoolean(TAG, true);
+                      d.setNameTagVisible(false);
+                      d.setNameTagAlwaysVisible(false);
+                      callBool(d, "setMovement", false);
+                      callBool(d, "setFriendly", true);
+                      callBool(d, "setCanBeSavedWithChunk", false);
+                      d.spawnToAll();
+                      getLogger().info("Morph: создан " + s.type.entityName + " id=" + d.getId()
+                              + " зрителей=" + d.getViewers().size());
+                      if (s.sitting) {
+                          setFlag(d, "DATA_FLAG_SITTING", 24, true);
+                      }
+                      if (s.fuseTicks > 0) {
+                          setFlag(d, "DATA_FLAG_IGNITED", 10, true);
+                      }
+                  } catch (Throwable t) {
+                      try {
+                          d.close();
+                      } catch (Throwable ignored) {
+                      }
+                      return null;
+                  }
+                  return d;
+              }
+
+              private void syncDouble(Session s) {
+                  Player p = s.player;
+                  Entity d = s.dbl;
+                  if (d == null || d.isClosed()) {
+                      return;
+                  }
+                  double head = p.yaw;
+                  if (!s.bodyInit) {
+                      s.bodyYaw = head;
+                      s.bodyInit = true;
+                      s.lastX = p.x;
+                      s.lastZ = p.z;
+                  }
+                  double mdx = p.x - s.lastX;
+                  double mdz = p.z - s.lastZ;
+                  s.lastX = p.x;
+                  s.lastZ = p.z;
+                  double diff = wrapDeg(head - s.bodyYaw);
+                  if (mdx * mdx + mdz * mdz > 0.0004) {
+                      diff *= 0.65;
+                  } else if (Math.abs(diff) > 50) {
+                      diff = Math.signum(diff) * 50;
+                  }
+                  s.bodyYaw = head - diff;
+                  d.setPositionAndRotation(new Vector3(p.x, p.y, p.z), s.bodyYaw, p.pitch);
+                  d.motionX = 0;
+                  d.motionY = 0;
+                  d.motionZ = 0;
+                  d.onGround = p.onGround;
+                  boolean sent = false;
+                  if (updateMovement != null) {
+                      try {
+                          updateMovement.invoke(d);
+                          sent = true;
+                      } catch (Throwable ignored) {
+                      }
+                  }
+                  if (!sent) {
+                      d.teleport(new Location(p.x, p.y, p.z, p.yaw, p.pitch, p.getLevel()));
+                  }
+                  sendHeadPacket(d, s.bodyYaw, head, p.pitch);
+                  // моб не должен показываться самому владельцу (иначе закрывает обзор)
+                  for (Player v : HIDE_FROM_OWNER ? d.getViewers().values() : new ArrayList<Player>()) {
+                      if (v == p) {
+                          d.despawnFrom(p);
+                          break;
+                      }
+                  }
+              }
+
+              // ===== Тик =====
+              private void tick() {
+                  if (sessions.isEmpty()) {
+                      return;
+                  }
+                  tickCounter++;
+                  for (Session s : new ArrayList<>(sessions.values())) {
+                      Player p = s.player;
+                      if (!p.isOnline()) {
+                          unmorph(p, true);
+                          continue;
+                      }
+                      if (s.dbl == null || s.dbl.isClosed() || s.dbl.getLevel() != p.getLevel()) {
+                          if (!respawnDouble(s)) {
+                              unmorph(p, true);
+                              p.sendMessage(PREFIX + "§cНе удалось пересоздать моба, превращение снято.");
+                              continue;
+                          }
+                      }
+                      syncDouble(s);
+                        if (s.angryTicks > 0 && --s.angryTicks == 0) {
+                            setFlag(s.dbl, "DATA_FLAG_ANGRY", 25, false);
+                        }
+
+                      if (tickCounter % 40 == 0) {
+                          if (p.getScale() != s.type.scale) {
+                              p.setScale(s.type.scale);
+                          }
+                          applyEffects(s);
+                      }
+                      if (tickCounter % 20 == 0 && s.type == MobType.ENDERMAN && p.isInsideOfWater()) {
+                          p.attack(new EntityDamageEvent(p, EntityDamageEvent.DamageCause.CUSTOM, 1f));
+                      }
+                      if (s.fuseTicks > 0) {
+                          s.fuseTicks--;
+                          if (s.fuseTicks == 0) {
+                              explode(s);
+                          }
+                      }
+                  }
+              }
+
+              // ===== Способности =====
+              @EventHandler
+              public void onSneak(PlayerToggleSneakEvent e) {
+                  Player p = e.getPlayer();
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s == null || s.dbl == null) {
+                      return;
+                  }
+                  boolean sneak = e.isSneaking();
+                  switch (s.type) {
+                      case CREEPER:
+                          if (sneak && s.fuseTicks == 0 && ready(s, CREEPER_COOLDOWN)) {
+                              s.fuseTicks = CREEPER_FUSE_TICKS;
+                              setFlag(s.dbl, "DATA_FLAG_IGNITED", 10, true);
+                              sound(p, "random.fuse", 1f);
+                          }
+                          break;
+                      case ENDERMAN:
+                          if (sneak && ready(s, ENDERMAN_COOLDOWN)) {
+                              blink(s);
+                          }
+                          break;
+                      case CAT:
+                          s.sitting = sneak;
+                          setFlag(s.dbl, "DATA_FLAG_SITTING", 24, sneak);
+                          if (sneak) {
+                              sound(p, "mob.cat.meow", 1f);
+                          }
+                          break;
+                      case WOLF:
+                          s.sitting = sneak;
+                          setFlag(s.dbl, "DATA_FLAG_SITTING", 24, sneak);
+                          if (sneak) {
+                              sound(p, "mob.wolf.bark", 1f);
+                          }
+                          break;
+                      case CHICKEN:
+                          if (sneak && ready(s, CHICKEN_COOLDOWN)) {
+                              p.getLevel().dropItem(new Vector3(p.x, p.y + 0.5, p.z), Item.get(Item.EGG, 0, 1));
+                              sound(p, "mob.chicken.plop", 1f);
+                          }
+                          break;
+                      case COW:
+                          if (sneak && ready(s, SOUND_COOLDOWN)) {
+                              sound(p, "mob.cow.say", 1f);
+                          }
+                          break;
+                      default:
+                          break;
+                  }
+              }
+
+              private boolean ready(Session s, long cooldownMs) {
+                  long now = System.currentTimeMillis();
+                  if (now < s.readyAt) {
+                      long left = (s.readyAt - now + 999) / 1000;
+                      s.player.sendPopup("§cПерезарядка: " + left + " с");
+                      return false;
+                  }
+                  s.readyAt = now + cooldownMs;
+                  return true;
+              }
+
+              private void explode(Session s) {
+                  Player p = s.player;
+                  Level lvl = p.getLevel();
+                  setFlag(s.dbl, "DATA_FLAG_IGNITED", 10, false);
+                  try {
+                      lvl.addParticle(new HugeExplodeSeedParticle(new Vector3(p.x, p.y + 1, p.z)));
+                  } catch (Throwable ignored) {
+                  }
+                  sound(p, "random.explode", 1f);
+                  Entity[] near = lvl.getNearbyEntities(
+                          p.getBoundingBox().grow(CREEPER_RADIUS, CREEPER_RADIUS, CREEPER_RADIUS), p);
+                  for (Entity t : near) {
+                      if (!(t instanceof Player) || t == p) {
+                          continue;
+                      }
+                      double dist = t.distance(p);
+                      if (dist > CREEPER_RADIUS) {
+                          continue;
+                      }
+                      float dmg = (float) Math.max(2.0, CREEPER_DAMAGE * (1.0 - dist / CREEPER_RADIUS));
+                      t.attack(new EntityDamageByEntityEvent(p, t, EntityDamageEvent.DamageCause.ENTITY_EXPLOSION, dmg));
+                  }
+              }
+
+              private void blink(Session s) {
+                  Player p = s.player;
+                  Level lvl = p.getLevel();
+                  Vector3 dir = p.getDirectionVector();
+                  double h = 1.8 * s.type.scale;
+                  Vector3 best = null;
+                  for (double d = 1.0; d <= BLINK_RANGE; d += 0.5) {
+                      double x = p.x + dir.x * d;
+                      double fy = p.y + dir.y * d;
+                      double z = p.z + dir.z * d;
+                      // позиция глаз -> позиция ног
+                      // fy уже позиция ног
+                      if (fy < 1) {
+                          break;
+                      }
+                      int bx = (int) Math.floor(x);
+                      int bz = (int) Math.floor(z);
+                      int y0 = (int) Math.floor(fy);
+                      int y1 = (int) Math.floor(fy + 1.0);
+                      int y2 = (int) Math.floor(fy + h - 0.01);
+                      if (lvl.getBlock(bx, y0, bz).isSolid()
+                              || (h > 1.0 && lvl.getBlock(bx, y1, bz).isSolid())
+                              || (h > 2.0 && lvl.getBlock(bx, (int) Math.floor(fy + 2.0), bz).isSolid())
+                              || lvl.getBlock(bx, y2, bz).isSolid()) {
+                          break;
+                      }
+                      best = new Vector3(x, fy, z);
+                  }
+                  if (best == null) {
+                      s.readyAt = 0;
+                      p.sendPopup("§cНекуда телепортироваться");
+                      return;
+                  }
+                  sound(p, "mob.endermen.portal", 1f);
+                  s.angryTicks = 20;
+                  setFlag(s.dbl, "DATA_FLAG_ANGRY", 25, true);
+                  p.teleport(new Location(best.x, best.y, best.z, p.yaw, p.pitch, lvl));
+                  sound(p, "mob.endermen.portal", 1f);
+              }
+
+              // ===== Урон и защита =====
+              @EventHandler(priority = EventPriority.HIGH)
+              public void onDamage(EntityDamageEvent e) {
+                  Entity victim = e.getEntity();
+
+                  if (e instanceof EntityDamageByEntityEvent) {
+                      Entity damager = ((EntityDamageByEntityEvent) e).getDamager();
+                      if (damager != null && byDouble.containsKey(damager.getId())) {
+                          e.setCancelled(true);
+                          return;
+                      }
+                  }
+
+                  Session ds = byDouble.get(victim.getId());
+                  if (ds != null) {
+                      e.setCancelled(true);
+                      if (e instanceof EntityDamageByEntityEvent) {
+                          Entity attacker = ((EntityDamageByEntityEvent) e).getDamager();
+                          if (attacker != null && attacker != ds.player
+                                  && sessions.get(ds.player.getUniqueId()) == ds) {
+                              ds.player.attack(new EntityDamageByEntityEvent(
+                                      attacker, ds.player, e.getCause(), e.getDamage()));
+                          }
+                      }
+                      return;
+                  }
+
+                  if (victim instanceof Player && e.getCause() == EntityDamageEvent.DamageCause.FALL) {
+                      Session s = sessions.get(((Player) victim).getUniqueId());
+                      if (s != null && s.type.noFall) {
+                          e.setCancelled(true);
+                      }
+                  }
+              }
+
+              @EventHandler
+              public void onExplosionPrime(EntityExplosionPrimeEvent e) {
+                  Entity en = e.getEntity();
+                  if (en != null && byDouble.containsKey(en.getId())) {
+                      e.setCancelled(true);
+                  }
+              }
+
+              @EventHandler
+              public void onSwing(PlayerAnimationEvent e) {
+                  Session s = sessions.get(e.getPlayer().getUniqueId());
+                  if (s == null || s.dbl == null) {
+                      return;
+                  }
+                  if (String.valueOf(e.getAnimationType()).contains("SWING")) {
+                      entityEvent(s.dbl, 4);
+                  }
+              }
+              
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onHurt(EntityDamageEvent e) {
+                  Entity v = e.getEntity();
+                  if (!(v instanceof Player)) {
+                      return;
+                  }
+                  Session s = sessions.get(((Player) v).getUniqueId());
+                  if (s == null || s.dbl == null) {
+                      return;
+                  }
+                  entityEvent(s.dbl, 2);
+                  sound((Player) v, hurtSound(s.type), 1f);
+              }
+              
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  unmorph(e.getPlayer(), true);
+              }
+
+              @EventHandler
+              public void onDeath(PlayerDeathEvent e) {
+                  Entity en = e.getEntity();
+                  if (!(en instanceof Player)) {
+                      return;
+                  }
+                  Player p = (Player) en;
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s != null && s.dbl != null && !s.dbl.isClosed()) {
+                      final Entity dying = s.dbl;
+                      entityEvent(dying, 3);
+                      s.dbl = null;
+                      getServer().getScheduler().scheduleDelayedTask(this, new Task() {
+                          @Override
+                          public void onRun(int currentTick) {
+                              byDouble.remove(dying.getId());
+                              try {
+                                  if (!dying.isClosed()) {
+                                      dying.close();
+                                  }
+                              } catch (Throwable ignored) {
+                              }
+                          }
+                      }, 25);
+                  }
+                  unmorph(p, true);
+              }
+
+              // ===== Утилиты =====
+              private void sound(Player p, String name, float pitch) {
+                  try {
+                      PlaySoundPacket pk = new PlaySoundPacket();
+                      pk.name = name;
+                      pk.x = (int) p.x;
+                      pk.y = (int) p.y;
+                      pk.z = (int) p.z;
+                      pk.volume = 1f;
+                      pk.pitch = pitch;
+                      Server.broadcastPacket(p.getLevel().getPlayers().values(), pk);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private static double wrapDeg(double a) {
+                  a = a % 360.0;
+                  if (a > 180) {
+                      a -= 360;
+                  }
+                  if (a < -180) {
+                      a += 360;
+                  }
+                  return a;
+              }
+              
+              private static void setNum(Object o, String field, double v) {
+                  try {
+                      java.lang.reflect.Field f = o.getClass().getField(field);
+                      Class<?> t = f.getType();
+                      if (t == float.class) {
+                          f.setFloat(o, (float) v);
+                      } else if (t == double.class) {
+                          f.setDouble(o, v);
+                      } else if (t == int.class) {
+                          f.setInt(o, (int) v);
+                      } else if (t == long.class) {
+                          f.setLong(o, (long) v);
+                      } else if (t == byte.class) {
+                          f.setByte(o, (byte) v);
+                      } else if (t == short.class) {
+                          f.setShort(o, (short) v);
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+              
+              private static void setBool(Object o, String field, boolean v) {
+                  try {
+                      o.getClass().getField(field).setBoolean(o, v);
+                  } catch (Throwable ignored) {
+                  }
+              }
+              
+              private void sendHeadPacket(Entity d, double body, double head, double pitch) {
+                  try {
+                      for (String fn : new String[]{"eid", "x", "y", "z", "yaw", "headYaw", "pitch"}) {
+                          MoveEntityAbsolutePacket.class.getField(fn);
+                      }
+                      MoveEntityAbsolutePacket pk = new MoveEntityAbsolutePacket();
+                      setNum(pk, "eid", d.getId());
+                      setNum(pk, "x", d.x);
+                      setNum(pk, "y", d.y);
+                      setNum(pk, "z", d.z);
+                      setNum(pk, "yaw", body);
+                      setNum(pk, "headYaw", head);
+                      setNum(pk, "pitch", pitch);
+                      setBool(pk, "onGround", d.onGround);
+                      setBool(pk, "teleport", false);
+                      Server.broadcastPacket(d.getViewers().values(), pk);
+                  } catch (Throwable ignored) {
+                  }
+              }
+              
+              // 2 = вспышка урона, 3 = анимация смерти, 4 = мах рукой
+              private void entityEvent(Entity d, int event) {
+                  if (d == null || d.isClosed()) {
+                      return;
+                  }
+                  try {
+                      EntityEventPacket pk = new EntityEventPacket();
+                      setNum(pk, "eid", d.getId());
+                      setNum(pk, "event", event);
+                      Server.broadcastPacket(d.getViewers().values(), pk);
+                  } catch (Throwable ignored) {
+                  }
+              }
+              
+              private static String hurtSound(MobType t) {
+                  switch (t) {
+                      case CREEPER:
+                          return "mob.creeper.say";
+                      case ENDERMAN:
+                          return "mob.endermen.hit";
+                      case PHANTOM:
+                          return "mob.phantom.hurt";
+                      case RABBIT:
+                          return "mob.rabbit.hurt";
+                      case CAT:
+                          return "mob.cat.hit";
+                      case WOLF:
+                          return "mob.wolf.hurt";
+                      case CHICKEN:
+                          return "mob.chicken.hurt";
+                      default:
+                          return "mob.cow.hurt";
+                  }
+              }
+              
+              private static int flag(String name, int fallback) {
+                  try {
+                      return Entity.class.getField(name).getInt(null);
+                  } catch (Throwable t) {
+                      return fallback;
+                  }
+              }
+
+              private static void setFlag(Entity en, String name, int fallback, boolean value) {
+                  if (en == null || en.isClosed()) {
+                      return;
+                  }
+                  try {
+                      en.setDataFlag(Entity.DATA_FLAGS, flag(name, fallback), value);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private static void callBool(Object o, String method, boolean value) {
+                  try {
+                      o.getClass().getMethod(method, boolean.class).invoke(o, value);
+                  } catch (Throwable ignored) {
+                  }
+              }
+          }
+          JAVA_EOF
+
+      - name: Build with Maven
+        run: mvn -B -q package
+
+      - name: Upload plugin jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Morph
+          path: target/Morph.jar
